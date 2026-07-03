@@ -1,0 +1,16 @@
+2026-07-03 17:50:48,407 | RetrainHMM           | INFO     | ============================================================
+2026-07-03 17:50:48,408 | RetrainHMM           | INFO     | Synqora Delta Gold Fable — HMM REGIME RETRAIN
+2026-07-03 17:50:48,408 | RetrainHMM           | INFO     | ============================================================
+2026-07-03 17:50:48,426 | DataEngine           | INFO     | MT5 connected | Build: 5833 | Connected: True
+2026-07-03 17:50:48,451 | DataEngine           | INFO     | [FETCH] GOLD M15: 72612 bars (2023-05-31 23:00:00+00:00 – 2026-06-29 23:00:00+00:00)
+2026-07-03 17:50:48,464 | DataEngine           | INFO     | [FETCH] GOLD H1: 18166 bars (2023-05-31 23:00:00+00:00 – 2026-06-29 23:00:00+00:00)
+2026-07-03 17:50:48,470 | DataEngine           | INFO     | [FETCH] GOLD H4: 4752 bars (2023-06-01 00:00:00+00:00 – 2026-06-29 20:00:00+00:00)
+2026-07-03 17:50:48,480 | RetrainHMM           | INFO     | Fitting HMM on 72612 M15 bars (2023-05-31 23:00:00+00:00 – 2026-06-29 23:00:00+00:00)
+2026-07-03 17:50:48,480 | RegimeDetector       | INFO     | Fitting HMM regime detector...
+2026-07-03 17:51:51,255 | RegimeDetector       | INFO     | HMM fitted. State map: {3: 'TREND_UP', 4: 'TREND_DOWN', 0: 'VOLATILE', 2: 'FLAT', 1: 'RANGING'}
+2026-07-03 17:51:51,263 | RegimeDetector       | INFO     | HMM saved: C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\hmm_regime.pkl
+2026-07-03 17:51:51,263 | RegimeDetector       | INFO     | RegimeRouter saved.
+2026-07-03 17:51:51,290 | RetrainHMM           | INFO     | Retrained HMM state map: {3: 'TREND_UP', 4: 'TREND_DOWN', 0: 'VOLATILE', 2: 'FLAT', 1: 'RANGING'}
+2026-07-03 17:51:51,291 | RetrainHMM           | INFO     | Current regime read-back: {'regime': 'VOLATILE', 'confidence': 0.9999925320496779, 'transition_risk': 0.17656388074826723, 'cusum_warning': False, 'trade_ok': True}
+2026-07-03 17:51:51,291 | RetrainHMM           | INFO     | Saved to C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models
+2026-07-03 17:51:51,291 | DataEngine           | INFO     | MT5 shutdown.

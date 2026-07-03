@@ -1,0 +1,6 @@
+2026-07-03 17:52:11,074 | ModelStack           | INFO     | [BUY] GBM specialist loaded from C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\gbm_buy.pkl
+2026-07-03 17:52:11,095 | ModelStack           | INFO     | [SELL] GBM specialist loaded from C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\gbm_sell.pkl
+2026-07-03 17:52:11,095 | ModelStack           | INFO     | ModelStack (GBM specialists) loaded.
+2026-07-03 17:52:11,096 | RegimeDetector       | INFO     | HMM loaded: C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\hmm_regime.pkl. State map: {3: 'TREND_UP', 4: 'TREND_DOWN', 0: 'VOLATILE', 2: 'FLAT', 1: 'RANGING'}
+2026-07-03 17:52:11,096 | RegimeDetector       | INFO     | RegimeRouter loaded.
+2026-07-03 17:52:11,096 | LiveTrader           | INFO     | Models loaded: GBM buy/sell + HMM regime router | 76 features

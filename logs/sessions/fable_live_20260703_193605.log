@@ -1,0 +1,25 @@
+2026-07-03 19:36:05,500 | LiveTrader       | INFO    | ============================================================
+2026-07-03 19:36:05,502 | LiveTrader       | INFO    | Synqora Delta Gold Fable v1.1.0 | DEMO-LIVE
+2026-07-03 19:36:05,502 | LiveTrader       | INFO    | Pipeline: GBM(M15) -> HMM regime gate -> Signal Queue -> M1 leading-indicator release -> risk-pct campaign
+2026-07-03 19:36:05,502 | LiveTrader       | INFO    | ============================================================
+2026-07-03 19:36:05,522 | DataEngine       | INFO    | MT5 connected | Build: 5833 | Connected: True
+2026-07-03 19:36:05,522 | LiveTrader       | INFO    | [MT5] Demo Account @ XMGlobal-MT5 7 | login=318167643 | equity=$257.63 USD | trade_mode=DEMO
+2026-07-03 19:36:05,692 | ModelStack       | INFO    | [BUY] GBM specialist loaded from C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\gbm_buy.pkl
+2026-07-03 19:36:05,711 | ModelStack       | INFO    | [SELL] GBM specialist loaded from C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\gbm_sell.pkl
+2026-07-03 19:36:05,712 | ModelStack       | INFO    | ModelStack (GBM specialists) loaded.
+2026-07-03 19:36:05,713 | RegimeDetector   | INFO    | HMM loaded: C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\models\hmm_regime.pkl. State map: {3: 'TREND_UP', 4: 'TREND_DOWN', 0: 'VOLATILE', 2: 'FLAT', 1: 'RANGING'}
+2026-07-03 19:36:05,714 | RegimeDetector   | INFO    | RegimeRouter loaded.
+2026-07-03 19:36:05,714 | LiveTrader       | INFO    | Models loaded: GBM buy/sell + HMM regime router | 76 features
+2026-07-03 19:36:05,715 | LiveTrader       | INFO    | [PREFLIGHT] Configuration as validated in research:
+2026-07-03 19:36:05,715 | LiveTrader       | INFO    | [PREFLIGHT]   symbol=GOLD primary=M15 execute_trades=True
+2026-07-03 19:36:05,715 | LiveTrader       | INFO    | [PREFLIGHT]   entry gate: prob>=0.6 edge>=0.15 regime_conf>=0.5
+2026-07-03 19:36:05,715 | LiveTrader       | INFO    | [PREFLIGHT]   queue: cap=20 release_score>=4.0 expiry=90min
+2026-07-03 19:36:05,715 | LiveTrader       | INFO    | [PREFLIGHT]   guards: news+extreme+H4zone | trend exemption=True (conf>=0.7)
+2026-07-03 19:36:05,716 | LiveTrader       | INFO    | [PREFLIGHT]   campaign: RISK_PCT 2.0%/trade cap=5.0 | A+ x2 prob>=0.7 equity>=$1000
+2026-07-03 19:36:05,716 | LiveTrader       | INFO    | [PREFLIGHT]   protection: BE@+1R below $500 (True) | neg-time-stop 24 bars | max hold 48 | daily limits -250.0/15000.0
+2026-07-03 19:36:05,716 | LiveTrader       | INFO    | [PREFLIGHT]   max positions/side=6 | session log: C:\Users\john_\Documents\Artificial Intelligence Trading BOT\Synqora Gold Stable V1\Synqora_Delta_Gold_Fable\logs\sessions\fable_live_20260703_193605.log
+2026-07-03 19:36:05,716 | LiveTrader       | INFO    | New trading day 2026-07-03. Session counters reset.
+2026-07-03 19:36:05,718 | LiveTrader       | INFO    | ── New M15 bar 2026-07-03 19:45:00+00:00 (#1) | queue depth 0 ──
+2026-07-03 19:36:05,847 | LiveTrader       | INFO    | [REGIME] VOLATILE conf=1.00 cusum_warning=False trade_ok=True
+2026-07-03 19:36:05,857 | LiveTrader       | INFO    | [MODEL] buy_prob=0.530 sell_prob=0.188
+2026-07-03 19:36:05,858 | LiveTrader       | INFO    | [META] NO_TRADE: buy_prob=0.530 < 0.6 | sell_prob=0.188 < 0.6

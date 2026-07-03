@@ -1,0 +1,15 @@
+# Runtime artifacts
+logs/
+data_cache/
+__pycache__/
+*.pyc
+
+# Local news calendar (may reflect your trading schedule)
+news_events.json
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Trained models are large binaries — decide deliberately whether to commit.
+# Uncomment to exclude them:
+# models/
