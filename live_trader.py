@@ -28,7 +28,7 @@ from config import (
     MODELS_DIR, LOGS_DIR, COOLDOWN_BARS, MAX_POSITIONS,
     REGIME_MIN_CONFIDENCE,
     REGIME_USE_TREND_DETECTOR,
-    QUEUE_DEDUP_SAME_SIDE_BARS,
+    QUEUE_MAX_PER_SIDE,
     DAILY_PROFIT_TARGET, DAILY_LOSS_LIMIT,
     REQUIRE_DEMO_ACCOUNT, ALLOW_REAL_ACCOUNT, EXECUTE_TRADES,
     HEARTBEAT_MINUTES,
@@ -279,11 +279,28 @@ class FableLiveTrader:
             buy_prob  = min(1.0, buy_prob * m30_prob_factor)
             sell_prob = min(1.0, sell_prob * m30_prob_factor)
 
-        # Dedup: skip if same side+family already queued very recently
-        dedup_minutes = QUEUE_DEDUP_SAME_SIDE_BARS * TF_MINUTES.get(PRIMARY_TF, 15)
-        if self.queue.has_recent_same_signal(signal_action, family, dedup_minutes):
-            logger.info(f"[QUEUE] Duplicate {signal_action} within "
-                        f"{dedup_minutes}min already queued. Skipping enqueue.")
+        # Allow up to QUEUE_MAX_PER_SIDE same-side+family signals; replace oldest when at cap
+        if self.queue.count_by_side_family(signal_action, family) >= QUEUE_MAX_PER_SIDE:
+            sig = QueuedSignal(
+                side         = signal_action,
+                family       = family,
+                source_cid   = f"{family}-{signal_action}-{uuid.uuid4().hex[:8]}",
+                queue_price  = queue_price,
+                queue_time   = datetime.now(timezone.utc),
+                m15_atr      = m15_atr,
+                queue_spread = get_current_spread_points(SYMBOL),
+                meta = {
+                    "buy_prob":   buy_prob,
+                    "sell_prob":  sell_prob,
+                    "m30_lot_mult": m30_lot_mult,
+                    "regime":     regime_result["regime"],
+                    "regime_conf": regime_result["confidence"],
+                },
+            )
+            old = self.queue.replace_oldest(signal_action, family, sig)
+            if old is not None:
+                logger.info(f"[QUEUE] Replaced oldest {signal_action} "
+                            f"(age={old.age_minutes():.1f}min) with {sig.source_cid}")
             return
 
         # Enqueue — never execute directly

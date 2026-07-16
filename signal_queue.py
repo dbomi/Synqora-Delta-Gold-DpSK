@@ -198,6 +198,25 @@ class SignalQueue:
         return False
 
     # ── Enqueue ────────────────────────────────────────────────────────────
+    def count_by_side_family(self, side: str, family: str) -> int:
+        """Count queued signals matching side + family."""
+        side = str(side).upper()
+        return sum(1 for s in self._slots if s.side == side and s.family == family)
+
+    def replace_oldest(self, side: str, family: str, new_sig: QueuedSignal) -> Optional[QueuedSignal]:
+        """Replace the oldest queued signal matching side+family with new_sig.
+        Returns the replaced signal, or None if nothing matched."""
+        side = str(side).upper()
+        for i, s in enumerate(self._slots):
+            if s.side == side and s.family == family:
+                old = self._slots[i]
+                self._slots[i] = new_sig
+                logger.info(f"[QUEUE] Replaced oldest {side} {family}: "
+                            f"{old.source_cid} (age={old.age_minutes():.1f}min) "
+                            f"with {new_sig.source_cid}")
+                return old
+        return None
+
     def enqueue(self, sig: QueuedSignal) -> Optional[QueuedSignal]:
         """
         Add a signal. If the queue is full, evict the oldest (first in)

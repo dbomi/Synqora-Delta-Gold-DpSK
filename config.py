@@ -260,7 +260,7 @@ M1_WAIT_FOR_CLOSE = False
 
 QUEUE_MAX_RELEASES_PER_CYCLE = 3      # Max signals released per M1 cycle
 QUEUE_MAX_RELEASES_PER_SIDE  = 2      # Direction balance: max 2 BUY + 1 SELL or 1 BUY + 2 SELL
-QUEUE_DEDUP_SAME_SIDE_BARS   = 1      # Skip enqueue if same side+family queued within N primary bars
+QUEUE_MAX_PER_SIDE            = 4      # Max same-side+family signals in queue; oldest replaced when exceeded
 
 # Leading-indicator score weights (M1 resolution, per queued signal)
 QUEUE_SCORE_WEIGHTS = {
