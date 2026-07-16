@@ -19,9 +19,11 @@ unit-tested without MT5.
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from config import (
@@ -32,6 +34,19 @@ from config import (
     H4_TOPZONE_GUARD_ENABLED, H4_TOPZONE_LOOKBACK_BARS, H4_TOPZONE_UPPER_PCT,
     H4_BOTTOMZONE_GUARD_ENABLED, H4_BOTTOMZONE_LOWER_PCT,
     GUARD_TREND_REGIME_EXEMPTION, GUARD_EXEMPT_MIN_REGIME_CONF,
+    SESSION_OPEN_BLOCK_ENABLED, SESSION_OPEN_BLOCK_MINUTES,
+    SESSION_OPEN_BLOCK_SESSIONS,
+    EXHAUSTION_FILTER_ENABLED, EXHAUSTION_MIN_CONSECUTIVE, EXHAUSTION_ROC_BARS,
+    REGIME_DIRECTION_GATE_ENABLED, REGIME_DIRECTION_GATE_CONFIDENCE,
+    REGIME_DIRECTION_GATE_BLOCK_SELL_UP, REGIME_DIRECTION_GATE_BLOCK_BUY_DN,
+    REGIME_DIRECTION_GATE_BLOCK_BUY_DN_MIN_CONF,
+    REGIME_CONFLICT_RESOLVER_ENABLED, REGIME_CONFLICT_OVERRIDE_MIN_PROB,
+    REGIME_CONFLICT_OVERRIDE_MIN_EDGE, REGIME_CONFLICT_OVERRIDE_MIN_SCORE,
+    REGIME_CONFLICT_REDUCED_RISK_MULT, REGIME_CONFLICT_STRUCTURE_BARS,
+    REGIME_CONFLICT_EMA_FAST, REGIME_CONFLICT_EMA_SLOW,
+    REGIME_CONFLICT_MIN_CONTRADICTIONS, REGIME_CONFLICT_HARD_BLOCK_MIN_SUPPORT,
+    MOMENTUM_ALIGNMENT_ENABLED, MOMENTUM_ALIGNMENT_LOOKBACK,
+    MOMENTUM_ALIGNMENT_MIN_POINTS,
 )
 
 logger = logging.getLogger("EntryGuards")
@@ -205,6 +220,323 @@ def h4_zone_reason(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4. SESSION OPEN BLOCK (P6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SESSION_TIMES = {
+    "SYDNEY":   (21, 6),
+    "TOKYO":    (0, 9),
+    "LONDON":   (7, 16),
+    "NEW_YORK": (12, 21),
+}
+
+
+def session_open_block_reason(now: Optional[datetime] = None) -> Optional[str]:
+    """
+    Block trades during the opening period of configured sessions.
+    The first SESSION_OPEN_BLOCK_MINUTES of each selected session are blocked.
+    """
+    if not SESSION_OPEN_BLOCK_ENABLED:
+        return None
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    hm = now.hour * 60 + now.minute
+    for sess_name in SESSION_OPEN_BLOCK_SESSIONS:
+        start_h, end_h = SESSION_TIMES.get(sess_name, (0, 24))
+        start_min = start_h * 60
+        # Handle overnight sessions (e.g. SYDNEY 21:00-06:00 UTC)
+        if start_h <= end_h:
+            in_session = start_min <= hm < end_h * 60
+        else:
+            in_session = hm >= start_min or hm < end_h * 60
+        if not in_session:
+            continue
+        session_elapsed = (hm - start_min) % 1440
+        if session_elapsed <= SESSION_OPEN_BLOCK_MINUTES:
+            return (f"session_open_block {sess_name} opened "
+                    f"{session_elapsed}min ago < {SESSION_OPEN_BLOCK_MINUTES}min")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. EXHAUSTION + DIVERGENCE FILTER (M5 candle pattern guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def exhaustion_divergence_reason(
+    side:   str,
+    df_m5:  pd.DataFrame,
+) -> Optional[str]:
+    """
+    BUY-ONLY: block entries that chase exhausted moves on M5.
+    BUY blocked when EXHAUSTION_MIN_CONSECUTIVE consecutive bearish M5
+    candles AND M5 ROC3 < 0 (buying a falling knife).
+
+    SELL side was tested live and found to kill more winners than it saves
+    (valid bounce shorts flagged as exhaustion). BUY-only catches 17% of
+    replay losers with 0% false positives on big winners.
+
+    Returns a reason string if blocked, or None if allowed.
+    """
+    if not EXHAUSTION_FILTER_ENABLED:
+        return None
+    min_bars = max(EXHAUSTION_ROC_BARS, EXHAUSTION_MIN_CONSECUTIVE) + 3
+    if df_m5 is None or len(df_m5) < min_bars:
+        return None
+
+    closes = df_m5["close"].astype(float)
+    opens  = df_m5["open"].astype(float)
+
+    # M5 ROC3 — is short-term momentum aligned with the entry?
+    roc3 = float(closes.pct_change(EXHAUSTION_ROC_BARS).iloc[-1])
+    if not np.isfinite(roc3):
+        return None
+
+    # Count consecutive same-direction candles (last EXHAUSTION_MIN_CONSECUTIVE bars)
+    cons = 0
+    for i in range(EXHAUSTION_MIN_CONSECUTIVE):
+        idx = -1 - i
+        if idx < -len(closes):
+            return None  # not enough bars
+        c_dir = np.sign(float(closes.iloc[idx]) - float(opens.iloc[idx]))
+        if c_dir == 0:
+            return None  # doji resets the count, don't block
+        if i == 0:
+            ref_dir = c_dir
+        elif c_dir != ref_dir:
+            return None  # streak broken, not exhaustion
+
+    side = str(side).upper()
+
+    if side == "BUY" and ref_dir < 0 and roc3 < 0:
+        return (f"exhaustion_divergence BUY {EXHAUSTION_MIN_CONSECUTIVE}+ bearish "
+                f"M5 candles (ref_dir={ref_dir}) + ROC3={roc3:+.4f} — falling knife")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. REGIME DIRECTION GATE (counter-trend blind spot guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RegimeDirectionAssessment:
+    """Structured result for the conflict-aware HMM direction resolver."""
+    action: str = "ALLOW"           # ALLOW | REDUCED | BLOCK
+    reason: str = ""
+    risk_multiplier: float = 1.0
+    contradicted: bool = False
+    evidence: Dict[str, object] = field(default_factory=dict)
+
+
+def _sign(value: float, eps: float = 1e-12) -> int:
+    if value > eps:
+        return 1
+    if value < -eps:
+        return -1
+    return 0
+
+
+def _structure_direction(df: Optional[pd.DataFrame], bars: int) -> int:
+    if df is None or len(df) < bars + 1 or "close" not in df:
+        return 0
+    closes = df["close"].astype(float)
+    return _sign(float(closes.iloc[-1] - closes.iloc[-1 - bars]))
+
+
+def _ema_direction(df: Optional[pd.DataFrame], fast: int, slow: int) -> int:
+    if df is None or len(df) < slow + 2 or "close" not in df:
+        return 0
+    closes = df["close"].astype(float)
+    ef = float(closes.ewm(span=fast, adjust=False).mean().iloc[-1])
+    es = float(closes.ewm(span=slow, adjust=False).mean().iloc[-1])
+    return _sign(ef - es)
+
+
+def _last_candle_direction(df: Optional[pd.DataFrame]) -> int:
+    if df is None or len(df) < 1:
+        return 0
+    row = df.iloc[-1]
+    return _sign(float(row["close"]) - float(row["open"]))
+
+
+def _break_of_structure_direction(df: Optional[pd.DataFrame], lookback: int = 3) -> int:
+    if df is None or len(df) < lookback + 1:
+        return 0
+    latest = df.iloc[-1]
+    prior = df.iloc[-(lookback + 1):-1]
+    close = float(latest["close"])
+    if close > float(prior["high"].max()):
+        return 1
+    if close < float(prior["low"].min()):
+        return -1
+    return 0
+
+
+def _m1_slope_direction(df_m1: Optional[pd.DataFrame], bars: int = 3) -> int:
+    return _structure_direction(df_m1, max(2, bars))
+
+
+def assess_regime_direction(
+    side: str,
+    regime: Optional[dict],
+    *,
+    df_m15: Optional[pd.DataFrame] = None,
+    df_h1: Optional[pd.DataFrame] = None,
+    df_m5: Optional[pd.DataFrame] = None,
+    df_m1: Optional[pd.DataFrame] = None,
+    prob: float = 0.0,
+    edge: float = 0.0,
+    queue_score: float = 0.0,
+) -> RegimeDirectionAssessment:
+    if not REGIME_DIRECTION_GATE_ENABLED or not regime:
+        return RegimeDirectionAssessment()
+
+    side = str(side).upper()
+    side_sign = 1 if side == "BUY" else -1
+    rname = str(regime.get("regime", "")).upper()
+    conf = float(regime.get("confidence", 0.0))
+    hmm_sign = 1 if rname == "TREND_UP" else -1 if rname == "TREND_DOWN" else 0
+
+    conflicts = (
+        side == "SELL" and REGIME_DIRECTION_GATE_BLOCK_SELL_UP and rname == "TREND_UP"
+    ) or (
+        side == "BUY" and REGIME_DIRECTION_GATE_BLOCK_BUY_DN and rname == "TREND_DOWN"
+        and conf >= REGIME_DIRECTION_GATE_BLOCK_BUY_DN_MIN_CONF
+    )
+    if not conflicts or conf < REGIME_DIRECTION_GATE_CONFIDENCE:
+        return RegimeDirectionAssessment()
+
+    if not REGIME_CONFLICT_RESOLVER_ENABLED:
+        return RegimeDirectionAssessment(
+            action="BLOCK",
+            reason=f"regime_direction {side} in {rname} (conf={conf:.2f})",
+        )
+
+    bars = max(2, int(REGIME_CONFLICT_STRUCTURE_BARS))
+    directions = {
+        "m15_structure": _structure_direction(df_m15, bars),
+        "m15_ema": _ema_direction(df_m15, REGIME_CONFLICT_EMA_FAST, REGIME_CONFLICT_EMA_SLOW),
+        "h1_structure": _structure_direction(df_h1, bars),
+        "h1_ema": _ema_direction(df_h1, REGIME_CONFLICT_EMA_FAST, REGIME_CONFLICT_EMA_SLOW),
+        "m5_candle": _last_candle_direction(df_m5),
+        "m5_bos": _break_of_structure_direction(df_m5, bars),
+        "m1_slope": _m1_slope_direction(df_m1, bars),
+    }
+    structural_keys = ("m15_structure", "m15_ema", "h1_structure", "h1_ema", "m5_bos")
+    contradiction_count = sum(directions[k] == side_sign for k in structural_keys)
+    hmm_support_count = sum(directions[k] == hmm_sign for k in structural_keys)
+    signal_support_count = sum(v == side_sign for v in directions.values())
+    m5_aligned = directions["m5_candle"] == side_sign or directions["m5_bos"] == side_sign
+    m1_aligned = directions["m1_slope"] == side_sign
+    contradicted = contradiction_count >= REGIME_CONFLICT_MIN_CONTRADICTIONS
+    high_quality = (
+        float(prob) >= REGIME_CONFLICT_OVERRIDE_MIN_PROB
+        and float(edge) >= REGIME_CONFLICT_OVERRIDE_MIN_EDGE
+        and float(queue_score) >= REGIME_CONFLICT_OVERRIDE_MIN_SCORE
+    )
+
+    evidence = {
+        **directions,
+        "hmm_regime": rname,
+        "hmm_confidence": conf,
+        "hmm_support_count": hmm_support_count,
+        "signal_support_count": signal_support_count,
+        "contradiction_count": contradiction_count,
+        "high_quality": high_quality,
+        "m5_aligned": m5_aligned,
+        "m1_aligned": m1_aligned,
+    }
+
+    if high_quality and m5_aligned and m1_aligned:
+        return RegimeDirectionAssessment(
+            action="REDUCED",
+            risk_multiplier=REGIME_CONFLICT_REDUCED_RISK_MULT,
+            contradicted=contradicted,
+            evidence=evidence,
+            reason=(f"regime conflict overridden at reduced risk: {side} vs {rname} "
+                    f"conf={conf:.2f}, prob={prob:.3f}, edge={edge:.3f}, "
+                    f"score={queue_score:.1f}, structure={contradiction_count}, "
+                    f"M5/M1 aligned"),
+        )
+
+    if contradicted and float(prob) >= 0.70 and float(edge) >= 0.35 \
+            and float(queue_score) >= 4.0 and m1_aligned and signal_support_count >= 3:
+        return RegimeDirectionAssessment(
+            action="REDUCED",
+            risk_multiplier=REGIME_CONFLICT_REDUCED_RISK_MULT,
+            contradicted=True,
+            evidence=evidence,
+            reason=(f"stale/contradicted HMM reduced-risk release: {side} vs {rname} "
+                    f"conf={conf:.2f}, signal_support={signal_support_count}, "
+                    f"hmm_support={hmm_support_count}"),
+        )
+
+    if hmm_support_count >= REGIME_CONFLICT_HARD_BLOCK_MIN_SUPPORT and not contradicted:
+        reason = (f"regime_direction {side} in {rname} (conf={conf:.2f}) — "
+                  f"HMM confirmed by {hmm_support_count} structure checks")
+    else:
+        reason = (f"regime_direction {side} in {rname} (conf={conf:.2f}) — "
+                  f"override evidence insufficient: prob={prob:.3f}, edge={edge:.3f}, "
+                  f"score={queue_score:.1f}, signal_support={signal_support_count}, "
+                  f"hmm_support={hmm_support_count}")
+    return RegimeDirectionAssessment(
+        action="BLOCK", reason=reason, contradicted=contradicted, evidence=evidence,
+    )
+
+
+def regime_direction_reason(side: str, regime: Optional[dict]) -> Optional[str]:
+    """Backwards-compatible string-only wrapper."""
+    result = assess_regime_direction(side, regime)
+    return result.reason if result.action == "BLOCK" else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. PRE-EXECUTION MOMENTUM ALIGNMENT GUARD (M1 slope check at release time)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def momentum_alignment_reason(
+    side:   str,
+    df_m1:  pd.DataFrame,
+) -> Optional[str]:
+    """
+    Blocks execution when M1 momentum at release time is moving strongly
+    against the signal direction. Catches the case where a signal was good
+    when queued (M15 close), but reversed during the queue wait.
+
+    Computes the average price change per M1 bar over the last N bars.
+    Blocks BUY if price is falling at >= MIN_POINTS per bar.
+    Blocks SELL if price is rising at >= MIN_POINTS per bar.
+
+    Returns a reason string if blocked, or None if allowed.
+    """
+    if not MOMENTUM_ALIGNMENT_ENABLED:
+        return None
+    lookback = max(MOMENTUM_ALIGNMENT_LOOKBACK, 2)
+    if df_m1 is None or len(df_m1) < lookback + 1:
+        return None
+
+    closes = df_m1["close"].astype(float).values
+    avg_delta = float((closes[-1] - closes[-1 - lookback]) / lookback)
+
+    side = str(side).upper()
+    min_pts = MOMENTUM_ALIGNMENT_MIN_POINTS
+
+    if side == "BUY" and avg_delta <= -min_pts:
+        return (f"momentum_alignment BUY blocked: M1 avg delta "
+                f"{avg_delta:+.2f} pts/bar ({lookback} bars) <= {min_pts} - "
+                f"price falling, signal stale")
+    if side == "SELL" and avg_delta >= min_pts:
+        return (f"momentum_alignment SELL blocked: M1 avg delta "
+                f"{avg_delta:+.2f} pts/bar ({lookback} bars) >= {min_pts} - "
+                f"price rising, signal stale")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # COMBINED HARD-BLOCK CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -249,6 +581,10 @@ def hard_block_reason(
     global trend_exemption_count
 
     reason = news_blackout_reason(now)
+    if reason:
+        return reason
+
+    reason = session_open_block_reason(now)
     if reason:
         return reason
 

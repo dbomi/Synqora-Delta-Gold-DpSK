@@ -32,14 +32,28 @@ from config import (
     MODELS_DIR, COOLDOWN_BARS, REGIME_MIN_CONFIDENCE,
     TRIPLE_BARRIER_TP_ATR, TRIPLE_BARRIER_SL_ATR,
     NEGATIVE_TIME_STOP_BARS, MAX_HOLD_BARS,
+    REGIME_USE_TREND_DETECTOR,
+    BREAKOUT_ENABLED, BREAKOUT_LOOKBACK_BARS,
+    BREAKOUT_VOLUME_MULT, BREAKOUT_MIN_STRENGTH,
+    DUAL_PATH_ENABLED, DUAL_PATH_ADX_MIN, DUAL_PATH_PROB_FALLBACK,
+    DUAL_PATH_MAX_ATR_EXTENSION,
+    DIRECTION_FILTER_ENABLED,
+    DIRECTION_FILTER_ALIGN_BOOST, DIRECTION_FILTER_OPPOSE_PENALTY,
+    DIRECTION_FILTER_LOT_ALIGN_BOOST, DIRECTION_FILTER_LOT_OPPOSE_PENALTY,
+    DIRECTION_FILTER_MIN_CONFIDENCE,
+    DIRECTION_FILTER_EMA_WEIGHT, DIRECTION_FILTER_MOMENTUM_WEIGHT,
+    DIRECTION_FILTER_ACCEL_WEIGHT, DIRECTION_FILTER_DI_WEIGHT,
+    DIRECTION_FILTER_SWING_WEIGHT,
+    RATCHET_ENABLED, RATCHET_ARM_AT_R, RATCHET_LOCK_AT_R,
+    RATCHET_VIRTUAL_LEVER,
 )
 from data_engine import initialize_mt5, shutdown_mt5, fetch_latest, align_to_primary
 from feature_engine import build_live_features
 from model_stack import ModelStack
-from regime_detector import RegimeRouter
+from regime_detector import RegimeRouter, TrendRegimeDetector, detect_market_breakout, check_trend_structure, m30_direction_filter
 from meta_agent import MetaAgent
 from signal_queue import SignalQueue, QueuedSignal
-from entry_guards import hard_block_reason
+from entry_guards import hard_block_reason, assess_regime_direction
 
 import pickle
 import os
@@ -113,7 +127,9 @@ def simulate_protection(tr: dict, dfm1: pd.DataFrame, arm_r: float, mode: str) -
     return {"outcome": outcome, "exit": exit_price, "pnl": pnl}
 
 
-def main():
+def main(day=None, fetch_mult=1):
+    """day: date to replay (default today, UTC). fetch_mult scales history
+    fetch depth so past days keep their full feature warmup."""
     enforce_guards = "--no-guards" not in sys.argv
     if not initialize_mt5():
         raise RuntimeError("MT5 connection failed. Open the terminal and log in.")
@@ -121,22 +137,28 @@ def main():
     try:
         # ── Load models ────────────────────────────────────────────────────
         stack  = ModelStack().load(MODELS_DIR)
-        router = RegimeRouter().load(MODELS_DIR)
+        router_cls = TrendRegimeDetector if REGIME_USE_TREND_DETECTOR else RegimeRouter
+        router = router_cls().load(MODELS_DIR)
         with open(os.path.join(MODELS_DIR, "feature_cols.pkl"), "rb") as f:
             feature_cols = pickle.load(f)
 
         # ── Fetch data (enough M15 warmup for the 271-bar feature warmup) ──
-        df15 = fetch_latest(SYMBOL, "M15", count=1200)
-        dfh1 = fetch_latest(SYMBOL, "H1",  count=600)
-        dfh4 = fetch_latest(SYMBOL, "H4",  count=300)
-        dfm1 = fetch_latest(SYMBOL, "M1",  count=2000)
-        dfm5 = fetch_latest(SYMBOL, "M5",  count=600)
+        df15 = fetch_latest(SYMBOL, "M15", count=1200 * fetch_mult)
+        dfh1 = fetch_latest(SYMBOL, "H1",  count=600 * fetch_mult)
+        dfh4 = fetch_latest(SYMBOL, "H4",  count=300 * fetch_mult)
+        dfm1 = fetch_latest(SYMBOL, "M1",  count=2000 * fetch_mult)
+        dfm5 = fetch_latest(SYMBOL, "M5",  count=600 * fetch_mult)
+        dfm30 = fetch_latest(SYMBOL, "M30", count=300 * fetch_mult)
         for name, d in [("M15", df15), ("H1", dfh1), ("H4", dfh4), ("M1", dfm1), ("M5", dfm5)]:
             if d.empty:
                 raise RuntimeError(f"No {name} data from MT5.")
 
-        today = datetime.now(timezone.utc).date()
+        today = day or datetime.now(timezone.utc).date()
         day_start = pd.Timestamp(today, tz="UTC")
+        day_end = day_start + pd.Timedelta(days=1)
+        # trim ALL frames so the replay of a past day never sees later data
+        df15, dfh1, dfh4 = (d[d.index < day_end] for d in (df15, dfh1, dfh4))
+        dfm1, dfm5, dfm30 = (d[d.index < day_end] for d in (dfm1, dfm5, dfm30))
         m1_today = dfm1[dfm1.index >= day_start]
         if m1_today.empty:
             raise RuntimeError("No M1 bars for today yet.")
@@ -193,6 +215,20 @@ def main():
                 if outcome is None and held_m15 >= MAX_HOLD_BARS:
                     exit_price, outcome = price, "MAX_HOLD"
 
+                # ── P17: Two-stage trailing ratchet + virtual lever ────────
+                if outcome is None and RATCHET_ENABLED:
+                    r_price = tr.get("r_price", TRIPLE_BARRIER_SL_ATR * tr.get("atr", 0.0))
+                    if r_price > 0:
+                        peak_r = tr["mfe"] / r_price
+                        if peak_r >= RATCHET_ARM_AT_R and not tr.get("r_locked", False):
+                            lock_sl = tr["entry"] + d * RATCHET_LOCK_AT_R * r_price
+                            if (d == 1 and lock_sl > tr["sl"]) or (d == -1 and lock_sl < tr["sl"]):
+                                tr["sl"] = lock_sl
+                                tr["r_locked"] = True
+                            if RATCHET_VIRTUAL_LEVER:
+                                if (d == 1 and lo <= lock_sl) or (d == -1 and hi >= lock_sl):
+                                    exit_price, outcome = lock_sl, "VLEV"
+
                 if outcome:
                     direction = 1 if tr["side"] == "BUY" else -1
                     move = (exit_price - tr["entry"]) * direction - tr["spread_cost"]
@@ -226,6 +262,23 @@ def main():
                                        current_bar=bar_no, cooldown_bars=COOLDOWN_BARS)
 
                 gate_ok = regime["trade_ok"] and regime["confidence"] >= REGIME_MIN_CONFIDENCE
+                # Option 2: Market-structure breakout override when gate is closed
+                breakout_override = None
+                if not gate_ok and BREAKOUT_ENABLED:
+                    try:
+                        breakout_override = detect_market_breakout(
+                            lookback_bars=BREAKOUT_LOOKBACK_BARS,
+                            vol_mult=BREAKOUT_VOLUME_MULT,
+                            min_strength=BREAKOUT_MIN_STRENGTH,
+                        )
+                    except Exception as e:
+                        log(f"[BREAKOUT] detection failed: {e}")
+                    if breakout_override is not None:
+                        gate_ok = True
+                        log(f"[BREAKOUT] {breakout_override['direction']} breakout "
+                            f"str={breakout_override['strength']:.2f} "
+                            f"— overriding regime gate")
+
                 events_signals.append({
                     "time": t.strftime("%H:%M"), "buy_p": probs["buy_prob"],
                     "sell_p": probs["sell_prob"], "regime": regime["regime"],
@@ -233,23 +286,82 @@ def main():
                     "action": decision.action if gate_ok else "NO_TRADE(regime)",
                 })
 
-                if gate_ok and decision.action in ("BUY", "SELL"):
-                    # dedup: one enqueue per side per M15 bar window
-                    le = last_enqueue[decision.action]
-                    if le is None or (t - le) >= pd.Timedelta(minutes=15):
-                        hl = d15["high"] - d15["low"]
-                        hc = (d15["high"] - d15["close"].shift(1)).abs()
-                        lc = (d15["low"]  - d15["close"].shift(1)).abs()
-                        atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1)
-                                    .ewm(span=14, adjust=False).mean().iloc[-1])
-                        sig = QueuedSignal(
-                            side=decision.action, family="GBM_M15",
-                            source_cid=f"GBM-{decision.action}-{uuid.uuid4().hex[:6]}",
-                            queue_price=price, queue_time=t.to_pydatetime(),
-                            m15_atr=atr, queue_spread=spread,
-                        )
-                        queue.enqueue(sig)
-                        last_enqueue[decision.action] = t
+                if gate_ok:
+                    # Determine signal action: from meta-agent or Option 3 dual-path
+                    signal_action = decision.action if decision.action in ("BUY", "SELL") else None
+                    if signal_action is None and DUAL_PATH_ENABLED:
+                        try:
+                            signal_action = check_trend_structure(
+                                d15, adx_min=DUAL_PATH_ADX_MIN,
+                                max_atr_extension=DUAL_PATH_MAX_ATR_EXTENSION)
+                        except Exception as e:
+                            log(f"[DUAL_PATH] check failed: {e}")
+                        if signal_action is not None:
+                            log(f"[DUAL_PATH] {signal_action} ADX+EMA signal "
+                                f"(prob={DUAL_PATH_PROB_FALLBACK:.2f})")
+
+                    # ── Option 4: M30 Trend-Context Modulator ───────────────
+                    m30_prob_factor = 1.0
+                    m30_lot_mult = 1.0
+                    if signal_action is not None and DIRECTION_FILTER_ENABLED:
+                        try:
+                            dm30 = closed_before(dfm30, t, 30)
+                            m30_dir = m30_direction_filter(
+                                dm30.tail(300) if not dm30.empty else pd.DataFrame(),
+                                min_swing_bars=5,
+                                ema_weight=DIRECTION_FILTER_EMA_WEIGHT,
+                                momentum_weight=DIRECTION_FILTER_MOMENTUM_WEIGHT,
+                                accel_weight=DIRECTION_FILTER_ACCEL_WEIGHT,
+                                di_weight=DIRECTION_FILTER_DI_WEIGHT,
+                                swing_weight=DIRECTION_FILTER_SWING_WEIGHT,
+                            )
+                        except Exception as e:
+                            m30_dir = {"direction": "NEUTRAL", "confidence": 0.0}
+                            log(f"[DIR_FILTER] check failed: {e}")
+                        m30_conf = m30_dir.get("confidence", 0.0)
+                        if m30_conf >= DIRECTION_FILTER_MIN_CONFIDENCE:
+                            if m30_dir["direction"] == signal_action:
+                                m30_prob_factor = 1.0 + m30_conf * DIRECTION_FILTER_ALIGN_BOOST
+                                m30_lot_mult = 1.0 + m30_conf * DIRECTION_FILTER_LOT_ALIGN_BOOST
+                                log(f"[DIR_FILTER] ALIGNED {signal_action} "
+                                    f"(m30_conf={m30_conf:.2f}, prob_f={m30_prob_factor:.3f}, lot_m={m30_lot_mult:.3f})")
+                            elif m30_dir["direction"] != "NEUTRAL":
+                                m30_prob_factor = max(0.1, 1.0 - m30_conf * DIRECTION_FILTER_OPPOSE_PENALTY)
+                                m30_lot_mult = max(0.1, 1.0 - m30_conf * DIRECTION_FILTER_LOT_OPPOSE_PENALTY)
+                                log(f"[DIR_FILTER] OPPOSED {signal_action} vs M30 {m30_dir['direction']} "
+                                    f"(m30_conf={m30_conf:.2f}, prob_f={m30_prob_factor:.3f}, lot_m={m30_lot_mult:.3f})")
+
+                    if signal_action is not None:
+                        is_dual_path = decision.action not in ("BUY", "SELL")
+                        family = "TREND_M15" if is_dual_path else "GBM_M15"
+                        buy_prob = DUAL_PATH_PROB_FALLBACK if (is_dual_path and signal_action == "BUY") else float(probs["buy_prob"])
+                        sell_prob = DUAL_PATH_PROB_FALLBACK if (is_dual_path and signal_action == "SELL") else float(probs["sell_prob"])
+                        # Apply M30 probability modulation (affects A+ dual-entry)
+                        if m30_prob_factor != 1.0:
+                            buy_prob  = min(1.0, buy_prob * m30_prob_factor)
+                            sell_prob = min(1.0, sell_prob * m30_prob_factor)
+
+                        # dedup: one enqueue per side per M15 bar window
+                        le = last_enqueue[signal_action]
+                        if le is None or (t - le) >= pd.Timedelta(minutes=15):
+                            hl = d15["high"] - d15["low"]
+                            hc = (d15["high"] - d15["close"].shift(1)).abs()
+                            lc = (d15["low"]  - d15["close"].shift(1)).abs()
+                            atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1)
+                                        .ewm(span=14, adjust=False).mean().iloc[-1])
+                            qprice = price
+                            sig = QueuedSignal(
+                                side=signal_action, family=family,
+                                source_cid=f"{family}-{signal_action}-{uuid.uuid4().hex[:6]}",
+                                queue_price=qprice, queue_time=t.to_pydatetime(),
+                                m15_atr=atr, queue_spread=spread,
+                                meta={"buy_prob": buy_prob, "sell_prob": sell_prob,
+                                      "m30_lot_mult": m30_lot_mult,
+                                      "regime": regime["regime"],
+                                      "regime_conf": regime["confidence"]},
+                            )
+                            queue.enqueue(sig)
+                            last_enqueue[signal_action] = t
 
             # ── M1 release cycle ─────────────────────────────────────────────
             if len(queue) > 0:
@@ -272,6 +384,21 @@ def main():
                 )
                 for item in released:
                     sig = item["signal"]
+
+                    # Regime direction gate at release time (matches live_trader)
+                    _prob_key = "buy_prob" if sig.side == "BUY" else "sell_prob"
+                    _other_key = "sell_prob" if sig.side == "BUY" else "buy_prob"
+                    _prob = float(sig.meta.get(_prob_key, 0.0))
+                    _edge = _prob - float(sig.meta.get(_other_key, 0.0))
+                    _score = float(item.get("score", 0.0))
+                    _rd = assess_regime_direction(
+                        sig.side, regime,
+                        df_m15=d15_g.tail(200), df_m5=dm5_g, df_m1=m1_closed.tail(80),
+                        prob=_prob, edge=_edge, queue_score=_score,
+                    )
+                    if _rd.action == "BLOCK":
+                        continue
+
                     direction = 1 if sig.side == "BUY" else -1
                     entry = price
                     sl = entry - direction * TRIPLE_BARRIER_SL_ATR * sig.m15_atr

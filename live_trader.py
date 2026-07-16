@@ -27,6 +27,7 @@ from config import (
     FAST_TF, QUEUE_ALIGN_TF, LOT_SIZE,
     MODELS_DIR, LOGS_DIR, COOLDOWN_BARS, MAX_POSITIONS,
     REGIME_MIN_CONFIDENCE,
+    REGIME_USE_TREND_DETECTOR,
     QUEUE_DEDUP_SAME_SIDE_BARS,
     DAILY_PROFIT_TARGET, DAILY_LOSS_LIMIT,
     REQUIRE_DEMO_ACCOUNT, ALLOW_REAL_ACCOUNT, EXECUTE_TRADES,
@@ -37,6 +38,24 @@ from config import (
     A_PLUS_PROB_THRESHOLD, A_PLUS_MIN_EQUITY,
     GUARD_TREND_REGIME_EXEMPTION, GUARD_EXEMPT_MIN_REGIME_CONF,
     USE_EQUITY_TIERED_BREAKEVEN, BREAKEVEN_EQUITY_CUTOFF,
+    BREAKEVEN_ALWAYS_ON, REGIME_PROTECTION_ENABLED,
+    PEAK_EXIT_ENABLED,
+    GOLDEN_HOUR_CAMPAIGN_ENABLED, GOLDEN_HOUR_LOT_MULT,
+    NEGATIVE_TIME_STOP_BARS, MAX_HOLD_BARS,
+    # Option 2: Breakout override
+    BREAKOUT_ENABLED, BREAKOUT_LOOKBACK_BARS,
+    BREAKOUT_VOLUME_MULT, BREAKOUT_MIN_STRENGTH,
+    # Option 3: Dual-path ADX+EMA signals
+    DUAL_PATH_ENABLED, DUAL_PATH_ADX_MIN, DUAL_PATH_PROB_FALLBACK,
+    DUAL_PATH_MAX_ATR_EXTENSION,
+    # Option 4: M30 Trend-Context Probability Modulator
+    DIRECTION_FILTER_ENABLED,
+    DIRECTION_FILTER_ALIGN_BOOST, DIRECTION_FILTER_OPPOSE_PENALTY,
+    DIRECTION_FILTER_LOT_ALIGN_BOOST, DIRECTION_FILTER_LOT_OPPOSE_PENALTY,
+    DIRECTION_FILTER_MIN_CONFIDENCE,
+    DIRECTION_FILTER_EMA_WEIGHT, DIRECTION_FILTER_MOMENTUM_WEIGHT,
+    DIRECTION_FILTER_ACCEL_WEIGHT, DIRECTION_FILTER_DI_WEIGHT,
+    DIRECTION_FILTER_SWING_WEIGHT,
 )
 from data_engine import (
     initialize_mt5, shutdown_mt5, fetch_multi_tf_latest, align_to_primary,
@@ -44,12 +63,12 @@ from data_engine import (
 )
 from feature_engine import build_live_features
 from model_stack import ModelStack
-from regime_detector import RegimeRouter
+from regime_detector import RegimeRouter, TrendRegimeDetector, detect_market_breakout, check_trend_structure, m30_direction_filter
 from meta_agent import MetaAgent
 from signal_queue import SignalQueue, QueuedSignal
-from entry_guards import hard_block_reason
+from entry_guards import hard_block_reason, exhaustion_divergence_reason, assess_regime_direction, momentum_alignment_reason
 from execution_engine import place_market_order, get_current_spread_points
-from position_manager import manage_open_positions, open_position_counts, open_positions_frame
+from position_manager import manage_open_positions, open_position_counts, open_positions_frame, start_regime_protection
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -87,7 +106,7 @@ class FableLiveTrader:
 
     def __init__(self):
         self.stack        = ModelStack()
-        self.regime       = RegimeRouter()
+        self.regime       = TrendRegimeDetector() if REGIME_USE_TREND_DETECTOR else RegimeRouter()
         self.meta         = MetaAgent()
         self.queue        = SignalQueue()
         self.feature_cols = []
@@ -102,10 +121,11 @@ class FableLiveTrader:
     # ── Startup ────────────────────────────────────────────────────────────
     def load_models(self):
         self.stack.load(MODELS_DIR)
-        self.regime.load(MODELS_DIR)
+        self.regime.load(MODELS_DIR)  # RegimeRouter loads HMM; TrendRegimeDetector is a no-op
         with open(os.path.join(MODELS_DIR, "feature_cols.pkl"), "rb") as f:
             self.feature_cols = pickle.load(f)
-        logger.info(f"Models loaded: GBM buy/sell + HMM regime router | "
+        detector_name = "Trend" if REGIME_USE_TREND_DETECTOR else "HMM"
+        logger.info(f"Models loaded: GBM buy/sell + {detector_name} regime router | "
                     f"{len(self.feature_cols)} features")
 
     # ── Daily session handling ────────────────────────────────────────────
@@ -155,9 +175,26 @@ class FableLiveTrader:
                     f"conf={regime_result['confidence']:.2f} "
                     f"cusum_warning={regime_result['cusum_warning']} "
                     f"trade_ok={regime_result['trade_ok']}")
-        if not regime_result["trade_ok"] or regime_result["confidence"] < REGIME_MIN_CONFIDENCE:
-            logger.info("[REGIME] Gate closed — no signal generation this bar.")
-            return
+        gate_closed = not regime_result["trade_ok"] or regime_result["confidence"] < REGIME_MIN_CONFIDENCE
+        if gate_closed:
+            # Option 2: Market-structure breakout override
+            breakout = None
+            if BREAKOUT_ENABLED:
+                try:
+                    breakout = detect_market_breakout(
+                        lookback_bars=BREAKOUT_LOOKBACK_BARS,
+                        vol_mult=BREAKOUT_VOLUME_MULT,
+                        min_strength=BREAKOUT_MIN_STRENGTH,
+                    )
+                except Exception as e:
+                    logger.warning(f"[BREAKOUT] detection failed: {e}")
+            if breakout is not None:
+                logger.info(f"[BREAKOUT] {breakout['direction']} breakout "
+                            f"str={breakout['strength']:.2f} conf={breakout['confidence']:.2f} "
+                            f"— overriding regime gate")
+            else:
+                logger.info("[REGIME] Gate closed — no signal generation this bar.")
+                return
 
         # GBM model probabilities
         model_output = self.stack.predict(features)
@@ -174,13 +211,78 @@ class FableLiveTrader:
             cooldown_bars  = COOLDOWN_BARS,
         )
         logger.info(f"[META] {decision.reason}")
-        if decision.action not in ("BUY", "SELL"):
+
+        # Determine signal action: from meta-agent or Option 3 dual-path
+        signal_action = decision.action if decision.action in ("BUY", "SELL") else None
+        if signal_action is None and DUAL_PATH_ENABLED:
+            try:
+                signal_action = check_trend_structure(
+                df_primary, adx_min=DUAL_PATH_ADX_MIN,
+                max_atr_extension=DUAL_PATH_MAX_ATR_EXTENSION)
+            except Exception as e:
+                logger.warning(f"[DUAL_PATH] check failed: {e}")
+            if signal_action is not None:
+                logger.info(f"[DUAL_PATH] {signal_action} ADX+EMA signal "
+                            f"(prob={DUAL_PATH_PROB_FALLBACK:.2f})")
+
+        # ── Option 4: M30 Trend-Context Modulator ───────────────────────────
+        # Two independent modulation paths:
+        #   1) m30_prob_factor — modulates buy_prob/sell_prob (affects A+ dual-entry)
+        #   2) m30_lot_mult — direct lot-size multiplier at execution time
+        m30_prob_factor = 1.0
+        m30_lot_mult = 1.0
+        if signal_action is not None and DIRECTION_FILTER_ENABLED:
+            try:
+                df_m30 = fetch_latest(SYMBOL, "M30", count=200)
+                if df_m30 is not None and len(df_m30) > 2:
+                    df_m30 = _drop_forming(df_m30, 30)
+                m30_dir = m30_direction_filter(
+                    df_m30 if df_m30 is not None else pd.DataFrame(),
+                    min_swing_bars=5,
+                    ema_weight=DIRECTION_FILTER_EMA_WEIGHT,
+                    momentum_weight=DIRECTION_FILTER_MOMENTUM_WEIGHT,
+                    accel_weight=DIRECTION_FILTER_ACCEL_WEIGHT,
+                    di_weight=DIRECTION_FILTER_DI_WEIGHT,
+                    swing_weight=DIRECTION_FILTER_SWING_WEIGHT,
+                )
+            except Exception as e:
+                m30_dir = {"direction": "NEUTRAL", "confidence": 0.0}
+                logger.warning(f"[DIR_FILTER] check failed: {e}")
+            m30_conf = m30_dir.get("confidence", 0.0)
+            if m30_conf >= DIRECTION_FILTER_MIN_CONFIDENCE:
+                if m30_dir["direction"] == signal_action:
+                    m30_prob_factor = 1.0 + m30_conf * DIRECTION_FILTER_ALIGN_BOOST
+                    m30_lot_mult = 1.0 + m30_conf * DIRECTION_FILTER_LOT_ALIGN_BOOST
+                    logger.info(f"[DIR_FILTER] ALIGNED {signal_action} "
+                                f"(m30_conf={m30_conf:.2f}, prob_f={m30_prob_factor:.3f}, lot_m={m30_lot_mult:.3f})")
+                elif m30_dir["direction"] != "NEUTRAL":
+                    m30_prob_factor = max(0.1, 1.0 - m30_conf * DIRECTION_FILTER_OPPOSE_PENALTY)
+                    m30_lot_mult = max(0.1, 1.0 - m30_conf * DIRECTION_FILTER_LOT_OPPOSE_PENALTY)
+                    logger.info(f"[DIR_FILTER] OPPOSED {signal_action} vs M30 {m30_dir['direction']} "
+                                f"(m30_conf={m30_conf:.2f}, prob_f={m30_prob_factor:.3f}, lot_m={m30_lot_mult:.3f})")
+
+        if signal_action is None:
             return
+
+        is_dual_path = decision.action not in ("BUY", "SELL")
+        if is_dual_path:
+            family    = "TREND_M15"
+            buy_prob  = DUAL_PATH_PROB_FALLBACK if signal_action == "BUY" else 0.0
+            sell_prob = DUAL_PATH_PROB_FALLBACK if signal_action == "SELL" else 0.0
+        else:
+            family    = "GBM_M15"
+            buy_prob  = decision.buy_prob
+            sell_prob = decision.sell_prob
+
+        # Apply M30 probability modulation (affects A+ dual-entry threshold)
+        if m30_prob_factor != 1.0:
+            buy_prob  = min(1.0, buy_prob * m30_prob_factor)
+            sell_prob = min(1.0, sell_prob * m30_prob_factor)
 
         # Dedup: skip if same side+family already queued very recently
         dedup_minutes = QUEUE_DEDUP_SAME_SIDE_BARS * TF_MINUTES.get(PRIMARY_TF, 15)
-        if self.queue.has_recent_same_signal(decision.action, "GBM_M15", dedup_minutes):
-            logger.info(f"[QUEUE] Duplicate {decision.action} within "
+        if self.queue.has_recent_same_signal(signal_action, family, dedup_minutes):
+            logger.info(f"[QUEUE] Duplicate {signal_action} within "
                         f"{dedup_minutes}min already queued. Skipping enqueue.")
             return
 
@@ -192,21 +294,23 @@ class FableLiveTrader:
         m15_atr = float(tr.ewm(span=14, adjust=False).mean().iloc[-1])
 
         tick = mt5.symbol_info_tick(SYMBOL)
-        queue_price = float(tick.ask if decision.action == "BUY" else tick.bid) \
+        live_price = float(tick.ask if signal_action == "BUY" else tick.bid) \
                       if tick else float(df_primary["close"].iloc[-1])
+        queue_price = live_price
 
         sig = QueuedSignal(
-            side         = decision.action,
-            family       = "GBM_M15",
-            source_cid   = f"GBM-{decision.action}-{uuid.uuid4().hex[:8]}",
+            side         = signal_action,
+            family       = family,
+            source_cid   = f"{family}-{signal_action}-{uuid.uuid4().hex[:8]}",
             queue_price  = queue_price,
             queue_time   = datetime.now(timezone.utc),
             m15_atr      = m15_atr,
             queue_spread = get_current_spread_points(SYMBOL),
             meta = {
-                "buy_prob":  decision.buy_prob,
-                "sell_prob": decision.sell_prob,
-                "regime":     decision.regime,
+                "buy_prob":   buy_prob,
+                "sell_prob":  sell_prob,
+                "m30_lot_mult": m30_lot_mult,
+                "regime":     regime_result["regime"],
                 "regime_conf": regime_result["confidence"],
             },
         )
@@ -226,6 +330,9 @@ class FableLiveTrader:
         df_m5 = df_m5.iloc[:-1] if not df_m5.empty else df_m5
 
         df_primary = fetch_latest(SYMBOL, PRIMARY_TF, count=120)
+        df_h1      = fetch_latest(SYMBOL, "H1", count=80)
+        if not df_h1.empty:
+            df_h1 = df_h1.iloc[:-1]
         df_h4      = fetch_latest(SYMBOL, "H4", count=40)
         if not df_h4.empty:
             df_h4 = df_h4.iloc[:-1]
@@ -263,15 +370,51 @@ class FableLiveTrader:
                             f"({counts[sig.side]}) reached. Dropping {sig.source_cid}.")
                 continue
 
-            # Scale campaign: risk-percent sizing + A+ dual entry.
+            # Exhaustion+divergence filter (M5 candle pattern guard)
+            exh_reason = exhaustion_divergence_reason(sig.side, df_m5)
+            if exh_reason:
+                logger.info(f"[EXEC] {sig.source_cid} blocked by exhaustion "
+                            f"filter: {exh_reason}")
+                continue
+
+            # Pre-execution momentum alignment (M1 slope vs signal direction)
+            ma_reason = momentum_alignment_reason(sig.side, df_m1)
+            if ma_reason:
+                logger.info(f"[EXEC] {sig.source_cid} blocked by momentum "
+                            f"alignment guard: {ma_reason}")
+                continue
+
+            # Conflict-aware regime direction gate
             prob_key = "buy_prob" if sig.side == "BUY" else "sell_prob"
+            other_key = "sell_prob" if sig.side == "BUY" else "buy_prob"
             prob = float(sig.meta.get(prob_key, 0.0))
+            other_prob = float(sig.meta.get(other_key, 0.0))
+            edge = prob - other_prob
+            score = float(item.get("score", 0.0))
+            rd = assess_regime_direction(
+                sig.side, self._last_regime,
+                df_m15=df_primary, df_h1=df_h1, df_m5=df_m5, df_m1=df_m1,
+                prob=prob, edge=edge, queue_score=score,
+            )
+            if rd.action == "BLOCK":
+                logger.info(f"[EXEC] {sig.source_cid} blocked by regime "
+                            f"direction gate: {rd.reason}")
+                continue
+
+            # Scale campaign: risk-percent sizing + A+ dual entry.
+            streak_mult = self.meta.streak_multiplier(sig.side)
+            if rd.action == "REDUCED":
+                streak_mult *= rd.risk_multiplier
             try:
                 from lot_campaign import get_signal_lots
-                lot_each, n_pos = get_signal_lots(sig.side, prob, sig.m15_atr)
+                lot_each, n_pos = get_signal_lots(sig.side, prob, sig.m15_atr, streak_mult=streak_mult)
             except Exception as e:
                 logger.warning(f"Campaign sizing failed ({e}); fallback 1x {LOT_SIZE}.")
                 lot_each, n_pos = LOT_SIZE, 1
+            # M30 trend-context lot-size modulation
+            m30_lot_mult = float(sig.meta.get("m30_lot_mult", 1.0))
+            if m30_lot_mult != 1.0:
+                lot_each = max(0.01, round(lot_each * m30_lot_mult / 0.01) * 0.01)
             if n_pos <= 0:
                 logger.warning(f"[EXEC] {sig.source_cid} sized to zero "
                                f"(no equity/margin room). Dropping.")
@@ -335,9 +478,13 @@ class FableLiveTrader:
         logger.info(f"[PREFLIGHT]   campaign: {LOT_SIZING_MODE} "
                     f"{RISK_PCT_PER_TRADE}%/trade cap={CAMPAIGN_MAX_LOT} | "
                     f"A+ x2 prob>={A_PLUS_PROB_THRESHOLD} equity>=${A_PLUS_MIN_EQUITY:.0f}")
-        logger.info(f"[PREFLIGHT]   protection: BE@+1R below "
-                    f"${BREAKEVEN_EQUITY_CUTOFF:.0f} ({USE_EQUITY_TIERED_BREAKEVEN}) | "
-                    f"neg-time-stop 24 bars | max hold 48 | "
+        be_mode = "ALWAYS-ON" if BREAKEVEN_ALWAYS_ON else f"tiered @${BREAKEVEN_EQUITY_CUTOFF:.0f}"
+        p14_mode = "+P14 regime ladder" if REGIME_PROTECTION_ENABLED else ""
+        p15_mode = "+P15 peak exit" if PEAK_EXIT_ENABLED else ""
+        gh_mode = f" | golden x{GOLDEN_HOUR_LOT_MULT}" if GOLDEN_HOUR_CAMPAIGN_ENABLED else ""
+        logger.info(f"[PREFLIGHT]   protection: BE{be_mode}{p14_mode}{p15_mode}{gh_mode} | "
+                    f"P11 MFE trail (auto) | "
+                    f"neg-time-stop {NEGATIVE_TIME_STOP_BARS} | max hold {MAX_HOLD_BARS} | "
                     f"daily limits {DAILY_LOSS_LIMIT}/{DAILY_PROFIT_TARGET}")
         logger.info(f"[PREFLIGHT]   max positions/side={MAX_POSITIONS} | "
                     f"session log: {SESSION_LOG}")
@@ -366,6 +513,7 @@ class FableLiveTrader:
         self._verify_demo_account()
         self.load_models()
         self._log_preflight()
+        start_regime_protection()
         last_heartbeat = time.monotonic()
 
         try:

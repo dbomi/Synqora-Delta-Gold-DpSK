@@ -36,7 +36,7 @@ from config import (
     QUEUE_MAX_RELEASES_PER_CYCLE, QUEUE_MAX_RELEASES_PER_SIDE,
     QUEUE_SCORE_WEIGHTS, QUEUE_M1_ROC_PERIOD, QUEUE_VOL_SPIKE_MULT,
     QUEUE_VOL_AVG_BARS, QUEUE_BODY_MIN_PROPORTION, QUEUE_WICK_BODY_RATIO,
-    QUEUE_SPREAD_TIGHTEN_RATIO,
+    QUEUE_SPREAD_TIGHTEN_RATIO, M5_ALIGNMENT_PRECONDITION,
 )
 
 logger = logging.getLogger("SignalQueue")
@@ -234,13 +234,15 @@ class SignalQueue:
         current_spread: float,
         hard_block_fn:  Optional[Callable[[QueuedSignal], Optional[str]]] = None,
         now:            Optional[datetime] = None,
+        regime:         Optional[str] = None,
     ) -> List[Dict]:
         """
         One M1 release cycle:
-          1. Expire stale signals.
+          1. Expire stale signals (P9: adaptive expiry for chased signals).
           2. Score every queued signal with the leading-indicator set.
-          3. Filter score ≥ QUEUE_RELEASE_SCORE and not hard-blocked.
-          4. Release best-first, capped at QUEUE_MAX_RELEASES_PER_CYCLE total
+          3. Filter score ≥ regime-conditional threshold (P2) and not hard-blocked.
+          4. Cluster gate (P4): cap same-side releases in a sliding window.
+          5. Release best-first, capped at QUEUE_MAX_RELEASES_PER_CYCLE total
              and QUEUE_MAX_RELEASES_PER_SIDE per side.
 
         hard_block_fn(sig) returns a block-reason string (blocked) or None.
@@ -250,16 +252,84 @@ class SignalQueue:
         Returns list of {"signal": QueuedSignal, "score": float,
                          "components": dict} released this cycle.
         """
+        from config import (ANTI_CHASE_ENABLED, ANTI_CHASE_TOLERANCE_ATR,
+                            MIN_RELEASE_AGE_MINUTES,
+                            QUEUE_RELEASE_SCORE_BY_REGIME,
+                            QUEUE_ADAPTIVE_EXPIRY_ENABLED,
+                            QUEUE_MAX_PENDING_MINUTES_CHASED,
+                            M1_WAIT_FOR_CLOSE)
+
+        # P9: Adaptive expiry — chased signals expire faster
+        if QUEUE_ADAPTIVE_EXPIRY_ENABLED and now is None:
+            now = datetime.now(timezone.utc)
+        for sig in list(self._slots):
+            if QUEUE_ADAPTIVE_EXPIRY_ENABLED:
+                tol = ANTI_CHASE_TOLERANCE_ATR * max(sig.m15_atr, 1e-9)
+                chased = (current_price < sig.queue_price - tol) if sig.side == "SELL" \
+                    else (current_price > sig.queue_price + tol)
+                if chased and sig.age_minutes(now) > QUEUE_MAX_PENDING_MINUTES_CHASED:
+                    self._slots.remove(sig)
+                    logger.info(f"[QUEUE] ADAPTIVE-EXPIRED {sig.side} {sig.source_cid} "
+                                f"chased age={sig.age_minutes(now):.1f}min > "
+                                f"{QUEUE_MAX_PENDING_MINUTES_CHASED}min")
+
         self.expire_stale(now=now)
         if not self._slots:
             return []
 
+        # P2: Regime-conditional release threshold
+        release_threshold = QUEUE_RELEASE_SCORE_BY_REGIME.get(
+            str(regime).upper() if regime else "", QUEUE_RELEASE_SCORE)
+
         candidates = []
         for sig in list(self._slots):
+            # proper delay: no release until the signal has aged past the
+            # impulse bar that created it — confirmation must be fresh bars
+            if MIN_RELEASE_AGE_MINUTES > 0 and \
+                    sig.age_minutes(now or datetime.now(timezone.utc)) \
+                    < MIN_RELEASE_AGE_MINUTES:
+                continue
+            # M1 close guard: signal must survive at least one full M1 bar
+            # boundary before releasing (mid-bar enqueue + release in same
+            # M1 bar uses stale closed-bar data for momentum indicators).
+            if M1_WAIT_FOR_CLOSE:
+                _n = now or datetime.now(timezone.utc)
+                if sig.queue_time.replace(second=0, microsecond=0) \
+                        >= _n.replace(second=0, microsecond=0):
+                    continue
+            # M5 alignment precondition: release only if the last closed M5
+            # candle direction matches the signal side. This catches entries
+            # against the M5 trend that M1 momentum alone misses.
+            if M5_ALIGNMENT_PRECONDITION:
+                _m5ok = False
+                if df_m5 is not None and len(df_m5) >= 1:
+                    _m5c = df_m5.iloc[-1]
+                    _m5d = np.sign(float(_m5c["close"]) - float(_m5c["open"]))
+                    if _m5d == _direction_sign(sig.side):
+                        _m5ok = True
+                if not _m5ok:
+                    continue
+
             result = score_signal(sig, df_m1, df_m5, current_price, current_spread)
             score  = result["score"]
-            if score < QUEUE_RELEASE_SCORE:
+            if score < release_threshold:
                 continue
+
+            # Anti-chase guard: only fill at-or-better than the queue price.
+            # SELL: price already fell past queue price -> entering here is
+            # chasing the bottom; hold (signal stays queued for a retrace).
+            # BUY mirrored. Tolerance = ANTI_CHASE_TOLERANCE_ATR x M15 ATR.
+            if ANTI_CHASE_ENABLED:
+                tol = ANTI_CHASE_TOLERANCE_ATR * max(sig.m15_atr, 1e-9)
+                chased = (current_price < sig.queue_price - tol) if sig.side == "SELL" \
+                    else (current_price > sig.queue_price + tol)
+                if chased:
+                    logger.info(
+                        f"[QUEUE] {sig.side} {sig.source_cid} score={score:.1f} "
+                        f"CHASE-HELD: price {current_price:.2f} beyond queue "
+                        f"{sig.queue_price:.2f} by more than {tol:.2f} "
+                        f"({ANTI_CHASE_TOLERANCE_ATR}xATR {sig.m15_atr:.2f})")
+                    continue
 
             if hard_block_fn is not None:
                 block_reason = hard_block_fn(sig)
@@ -271,6 +341,26 @@ class SignalQueue:
             candidates.append({"signal": sig, "score": score,
                                "components": result["components"]})
 
+        if not candidates:
+            return []
+
+        from config import (QUEUE_CLUSTER_GATE_ENABLED,
+                            QUEUE_CLUSTER_GATE_WINDOW_MIN,
+                            QUEUE_CLUSTER_GATE_MAX_PER_SIDE)
+
+        # P4: Cluster gate — check recently released by side in the window
+        if QUEUE_CLUSTER_GATE_ENABLED and hasattr(self, '_release_history'):
+            window_start = (now or datetime.now(timezone.utc)) - \
+                pd.Timedelta(minutes=QUEUE_CLUSTER_GATE_WINDOW_MIN)
+            recent = [r for r in self._release_history
+                      if r["time"] >= window_start]
+            side_count = {}
+            for r in recent:
+                side_count[r["side"]] = side_count.get(r["side"], 0) + 1
+            candidates = [
+                c for c in candidates
+                if side_count.get(c["signal"].side, 0) < QUEUE_CLUSTER_GATE_MAX_PER_SIDE
+            ]
         if not candidates:
             return []
 
@@ -291,5 +381,22 @@ class SignalQueue:
             comp_str = ", ".join(f"{k}=+{v:.1f}" for k, v in cand["components"].items())
             logger.info(f"[QUEUE] RELEASE {side} {cand['signal'].source_cid} "
                         f"score={cand['score']:.1f} [{comp_str}]")
+
+        # Store release history for P4 cluster gate
+        if QUEUE_CLUSTER_GATE_ENABLED:
+            if not hasattr(self, '_release_history'):
+                self._release_history = []
+            now_t = now or datetime.now(timezone.utc)
+            for cand in released:
+                self._release_history.append({
+                    "side": cand["signal"].side,
+                    "time": now_t,
+                    "cid": cand["signal"].source_cid,
+                })
+            # Prune old entries
+            window_start = now_t - pd.Timedelta(minutes=QUEUE_CLUSTER_GATE_WINDOW_MIN)
+            self._release_history = [
+                r for r in self._release_history if r["time"] >= window_start
+            ]
 
         return released

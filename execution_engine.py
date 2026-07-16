@@ -147,8 +147,39 @@ def place_market_order(
                        error_msg="all_retries_failed")
 
 
+def _clamp_sl_to_broker_rules(
+    symbol: str, ticket: int, desired_sl: float, is_buy: bool,
+) -> float:
+    """
+    Broker-enforced minimum stop distance: SL must be at least
+    `symbol.volume_stops` OR `stops_level` points away from current price.
+    If the desired_sl violates this, push it away to the minimum.
+    Returns the clamped SL value.
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return desired_sl
+    point = float(info.point or 0.01)
+    stops_level = int(getattr(info, "stops_level", 0) or 0)
+    # Some brokers use volume_stops instead
+    vol_stops = int(getattr(info, "volume_stops", 0) or 0)
+    min_dist_pts = max(stops_level, vol_stops, 10)  # at least 10 pts safety
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return desired_sl
+    price = tick.bid if is_buy else tick.ask
+    min_dist = min_dist_pts * point
+
+    if is_buy and desired_sl > price - min_dist:
+        return round(price - min_dist, info.digits)
+    if not is_buy and desired_sl < price + min_dist:
+        return round(price + min_dist, info.digits)
+    return round(desired_sl, info.digits)
+
+
 def modify_position_sl(ticket: int, new_sl: float, symbol: str = SYMBOL) -> bool:
-    """Move a position's SL (TP untouched). Returns True on success."""
+    """Move a position's SL (TP untouched). Respects broker min stop distance."""
     positions = mt5.positions_get(ticket=ticket)
     if not positions:
         logger.warning(f"[EXEC] SL modify failed: ticket {ticket} not found.")
@@ -157,20 +188,29 @@ def modify_position_sl(ticket: int, new_sl: float, symbol: str = SYMBOL) -> bool
     info = mt5.symbol_info(symbol)
     digits = info.digits if info else 2
 
+    is_buy = pos.type == mt5.POSITION_TYPE_BUY
+    clamped = _clamp_sl_to_broker_rules(symbol, ticket, new_sl, is_buy)
+
     request = {
         "action":   mt5.TRADE_ACTION_SLTP,
         "symbol":   symbol,
         "position": ticket,
-        "sl":       round(float(new_sl), digits),
+        "sl":       clamped,
         "tp":       pos.tp,
         "magic":    MAGIC_NUMBER,
     }
     result = mt5.order_send(request)
     if result is not None and result.retcode in SUCCESS_RETCODES:
-        logger.info(f"[EXEC] SL moved: ticket={ticket} {pos.sl:.2f} -> {new_sl:.2f}")
+        if clamped != round(float(new_sl), digits):
+            logger.info(f"[EXEC] SL moved: ticket={ticket} {pos.sl:.2f} -> {clamped:.2f} "
+                        f"(requested {new_sl:.2f} adjusted for broker min stop)")
+        else:
+            logger.info(f"[EXEC] SL moved: ticket={ticket} {pos.sl:.2f} -> {clamped:.2f}")
         return True
     logger.warning(f"[EXEC] SL modify failed for {ticket}: "
-                   f"retcode={result.retcode if result else 'None'}")
+                   f"retcode={result.retcode if result else 'None'} "
+                   f"(req SL={clamped:.2f}, price={pos.price_current:.2f}, "
+                   f"stops_level={getattr(info, 'stops_level', '?')})")
     return False
 
 
